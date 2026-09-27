@@ -18,23 +18,147 @@ pair of runs tells you that you wrote the right property.
 
 ## What you are told about the bug
 
-- It is in the **broker**, not in any client library, and not in the KRaft
-  controller or the storage layer.
-- It concerns **what the broker promises a client** about a write. Under an
-  ordinary sequence of events the promise is kept. Under an unlucky sequence
-  of failures, it is not.
-- It needs a **fault** to become visible: no amount of load against a healthy
-  cluster will trigger it. Antithesis injects faults for you (broker kills,
-  pauses, network partitions, clock skew). Your workload has to be running the
-  right kind of traffic when the fault lands, and has to be able to *notice*
-  afterwards.
-- The cluster is 3 KRaft nodes, replication factor 3, `min.insync.replicas=2`,
-  unclean leader election off, auto topic creation off. Every one of those
-  matters to the property you end up writing. Do not change them.
+Quite a lot, as it turns out. The exercise is not to guess the bug. It is to
+write a workload and a property that catch it, and to prove the property is
+fair by running it against the unmodified broker too.
 
-Think about which guarantees Kafka makes to a producer or consumer under that
-configuration, which of them a client could actually *check* from the outside,
-and what evidence you would need to have recorded beforehand to check it.
+### Kafka in one paragraph
+
+Kafka is a system for storing a stream of messages so other programs can read
+them later. Think of a topic as a notebook. Each message is written on the
+next blank line, and the lines are numbered from zero. A producer is a program
+that writes lines; a consumer reads them in order.
+
+### Copies, and who is in charge
+
+One notebook on one machine is fragile. So Kafka keeps three copies of each
+notebook on three different machines, called brokers. One copy is the leader.
+Producers write to the leader only. The other two are followers. They
+constantly ask the leader "anything new?" and copy the new lines into their
+own notebook. Followers that are keeping up are called in-sync replicas, or
+the ISR.
+
+If the leader's machine dies, one of the in-sync followers is promoted to
+leader and writing continues. That is the whole point of the copies.
+
+### The promise: "acknowledge only when the copies have it"
+
+When a producer writes a line, it can ask Kafka to only say "got it" once the
+line is safely on every in-sync copy. That setting is called `acks=all`. Your
+workload will use it. The promise is: if the producer heard "got it", the line
+will survive a broker dying, because the followers already have it.
+
+How does the leader know the followers have caught up? It tracks a single
+number called the high watermark: the line number that every in-sync copy has
+reached. If the high watermark is 42, every copy has lines 0 through 41.
+
+### The line of code that keeps the promise
+
+When the leader writes a new line, say line 41, it notes "this request is done
+when the high watermark reaches 42", meaning all copies have everything
+through line 41. The check reads:
+
+```
+if the high watermark >= 42, tell the producer "got it"
+```
+
+Until the followers copy line 41, the high watermark stays at 41 and the
+producer waits.
+
+### The bug I introduced
+
+I changed the check to:
+
+```
+if the high watermark >= 41, tell the producer "got it"
+```
+
+One less. Now the leader says "got it" as soon as the copies have line 40.
+Line 41, the one just written, is allowed to exist on the leader alone. In
+practice the followers copy it a few milliseconds later and most of the time
+nobody notices.
+
+**Why it is a believable mistake.** Programmers constantly confuse "the number
+of the last line written" (41) with "the number of the next line" (42).
+Kafka's own code uses both meanings in different files. Writing `- 1` here
+looks reasonable to someone who has the wrong one in their head. It compiles,
+tests pass, and a healthy cluster behaves perfectly.
+
+### How it loses data
+
+1. Producer writes line 41. Leader says "got it" before the followers have it.
+   The producer trusts this and moves on to line 42.
+2. The leader's machine dies right then.
+3. A follower is promoted. Its notebook ends at line 40.
+4. The producer's line 42 arrives at the new leader and is written as its
+   line 41.
+5. A reader sees the message that was labelled 40, then the one labelled 42.
+   The message labelled 41 is gone, even though Kafka said "got it".
+
+### How a test catches it
+
+The workload writes messages labelled 0, 1, 2, and so on, one at a time,
+sending the next only after "got it" for the previous. A reader then checks
+that no label is skipped. An assertion along the lines of *no acknowledged
+message is skipped* fails the moment a reader sees 40 followed by 42.
+
+### Why running it on a laptop does not show the bug
+
+Step 2 has to happen inside the few milliseconds between the leader
+acknowledging and the followers copying the line. Nothing in a normal run does
+that. Antithesis exists to hit windows like this: it kills, pauses and
+partitions brokers inside a simulator and explores many timelines until one
+lands in the window.
+
+I tried to force it by hand by freezing the followers and killing the leader,
+but the followers had already received the line over the network before I
+froze them, so nothing was lost. A cleaner forced repro would kill the
+followers' network first. It is not needed for the real test.
+
+### The cluster you get
+
+3 KRaft nodes, replication factor 3, `min.insync.replicas=2`, unclean leader
+election off, auto topic creation off. This is the configuration under which
+Kafka genuinely makes the promise above, so it is what makes your property
+fair to the unmodified broker. Do not change it.
+
+### Client configuration to use
+
+These are the client settings to use. They are the ones under which the
+promise above actually applies, they hold for any client library, and they
+keep you from spending the exercise on Kafka client tuning.
+
+**Topics.** Auto-creation is off, so create topics yourself through the admin
+API, with 1 partition, replication factor 3, `min.insync.replicas=2`,
+`unclean.leader.election.enable=false`, and retention disabled
+(`retention.ms=-1`, `retention.bytes=-1`) so nothing you wrote is ever
+deleted under you. Give every producer its own topic; it makes "what did I
+write here" unambiguous.
+
+**Producer.**
+
+| Setting | Value | Why |
+| --- | --- | --- |
+| `acks` | `all` | The promise under test. Anything weaker and losing a write on leader failure is allowed behaviour. |
+| `enable.idempotence` | `true` | Retries inside the client cannot reorder or duplicate. Any duplicates you see are your own. |
+| `linger.ms` | `0` | One record per request. Do not batch. |
+| `message.timeout.ms` | `30000` | Bounds how long a send retries internally before it reports failure to you. |
+| `request.timeout.ms` | `10000` | Same idea, per request. |
+
+Send **one record at a time** and wait for its acknowledgement before sending
+the next. When a send reports failure, the record may or may not be in the
+log: **resend the same record, never skip it**. If the client reports a fatal
+error (the idempotent producer can), create a new producer and carry on with
+the same record.
+
+**Consumer.** Use manual partition assignment (`assign`), not consumer groups
+(`subscribe`): no group coordination, no rebalances, and every reader sees the
+whole stream. Read from offset 0. Turn off auto-commit and offset storing;
+nothing should ever be committed. Set a `group.id` only if your client
+insists on one.
+
+Under faults, a fetch or metadata call failing is normal and is **not** a
+violation. Only the data you actually read is evidence.
 
 ## What you build
 
@@ -204,8 +328,8 @@ promise you assumed that Kafka never made.
   name, the broker image tag is the only line on which `config/` and
   `config-baseline/` differ. It must stay that way for the pair of runs to
   mean anything.
-- Do not go looking for the patch or the reference workload that produced these
-  images until you have two runs that disagree. Compare notes afterwards.
+- You know the bug. You do not get the reference workload that first caught
+  it until you have two runs that disagree. Compare notes afterwards.
 
 ## Layout
 

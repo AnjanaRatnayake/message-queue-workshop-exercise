@@ -95,26 +95,6 @@ tests pass, and a healthy cluster behaves perfectly.
 5. A reader sees the message that was labelled 40, then the one labelled 42.
    The message labelled 41 is gone, even though Kafka said "got it".
 
-### How a test catches it
-
-The workload writes messages labelled 0, 1, 2, and so on, one at a time,
-sending the next only after "got it" for the previous. A reader then checks
-that no label is skipped. An assertion along the lines of *no acknowledged
-message is skipped* fails the moment a reader sees 40 followed by 42.
-
-### Why running it on a laptop does not show the bug
-
-Step 2 has to happen inside the few milliseconds between the leader
-acknowledging and the followers copying the line. Nothing in a normal run does
-that. Antithesis exists to hit windows like this: it kills, pauses and
-partitions brokers inside a simulator and explores many timelines until one
-lands in the window.
-
-I tried to force it by hand by freezing the followers and killing the leader,
-but the followers had already received the line over the network before I
-froze them, so nothing was lost. A cleaner forced repro would kill the
-followers' network first. It is not needed for the real test.
-
 ### The cluster you get
 
 3 KRaft nodes, replication factor 3, `min.insync.replicas=2`, unclean leader

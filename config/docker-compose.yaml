@@ -1,0 +1,93 @@
+# Starter Antithesis config for the kafka-alo exercise (see ../README.md).
+#
+# Everything here is image-only: no `build:` blocks. Antithesis pulls every
+# `image:` below from the tenant registry
+#   us-central1-docker.pkg.dev/molten-verve-216720/TENANT_NAME-repository/
+# so a bare name like `kafka-alo-broker:m01` resolves to the pre-pushed image.
+#
+# You edit exactly two things:
+#   1. the `workload` service's `image:` -> your pushed workload image
+#   2. nothing else. ../config-baseline/docker-compose.yaml is the same file with
+#      the unmodified broker image; point its workload at the same image.
+# Leave the broker environment alone: the property you write is stated against
+# this replication configuration, and weakening it will make BOTH images fail.
+
+name: kafka-alo
+
+x-broker-common: &broker-common
+  platform: linux/amd64
+  init: true
+  image: kafka-alo-broker:m01          # <- the bugged broker; ../config-baseline uses :baseline
+  healthcheck:
+    test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/9092"]
+    interval: 5s
+    timeout: 3s
+    retries: 60
+    start_period: 20s
+
+x-broker-env: &broker-env
+  NO_COLOR: "1"
+  CLUSTER_ID: "4L6g3nShT-eMCtK--X86sw"
+  KAFKA_PROCESS_ROLES: "broker,controller"
+  KAFKA_CONTROLLER_QUORUM_VOTERS: "1@kafka-1:9093,2@kafka-2:9093,3@kafka-3:9093"
+  KAFKA_LISTENERS: "PLAINTEXT://:9092,CONTROLLER://:9093"
+  KAFKA_INTER_BROKER_LISTENER_NAME: "PLAINTEXT"
+  KAFKA_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
+  KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT"
+  KAFKA_LOG_DIRS: "/var/lib/kafka/data"
+  KAFKA_DEFAULT_REPLICATION_FACTOR: "3"
+  KAFKA_MIN_INSYNC_REPLICAS: "2"
+  KAFKA_UNCLEAN_LEADER_ELECTION_ENABLE: "false"
+  KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+  KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "3"
+  KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "3"
+  KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "2"
+  KAFKA_SHARE_COORDINATOR_STATE_TOPIC_REPLICATION_FACTOR: "3"
+  KAFKA_SHARE_COORDINATOR_STATE_TOPIC_MIN_ISR: "2"
+  KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: "0"
+  KAFKA_NUM_PARTITIONS: "1"
+
+services:
+  kafka-1:
+    <<: *broker-common
+    container_name: kafka-1
+    hostname: kafka-1
+    environment:
+      <<: *broker-env
+      KAFKA_NODE_ID: "1"
+      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://kafka-1:9092"
+
+  kafka-2:
+    <<: *broker-common
+    container_name: kafka-2
+    hostname: kafka-2
+    environment:
+      <<: *broker-env
+      KAFKA_NODE_ID: "2"
+      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://kafka-2:9092"
+
+  kafka-3:
+    <<: *broker-common
+    container_name: kafka-3
+    hostname: kafka-3
+    environment:
+      <<: *broker-env
+      KAFKA_NODE_ID: "3"
+      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://kafka-3:9092"
+
+  workload:
+    container_name: kafka-alo-workload
+    hostname: kafka-alo-workload
+    platform: linux/amd64
+    init: true
+    image: kafka-alo-workload:YOURNAME   # <- your image, pushed to the tenant registry
+    environment:
+      NO_COLOR: "1"
+      KAFKA_BOOTSTRAP: "kafka-1:9092,kafka-2:9092,kafka-3:9092"
+    depends_on:
+      kafka-1:
+        condition: service_healthy
+      kafka-2:
+        condition: service_healthy
+      kafka-3:
+        condition: service_healthy
